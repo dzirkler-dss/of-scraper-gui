@@ -42,10 +42,10 @@ jobs:
             type=raw,value=3.14.7,enable={{is_default_branch}}
             type=sha,prefix=
 
-      - name: Stage patch scripts at repo root (upstream Dockerfile expects them there)
+      - name: Stage patch scripts into version dirs (upstream Dockerfile expects them there)
         run: |
           for v in 3.12.9 3.14.3 3.14.5 3.14.7; do
-            cp "OF-Scraper-${v}/patch_ofscraper_${v}_gui.py" .
+            cp "patch_ofscraper_${v}_gui.py" "OF-Scraper-${v}/"
           done
 
       - name: Build and push
