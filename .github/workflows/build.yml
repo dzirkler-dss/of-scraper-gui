@@ -2,10 +2,10 @@ name: Build OF-Scraper GUI image
 
 on:
   push:
-    branches: [main]
+    branches: [main, fork/build-p422]
     paths:
       - 'docker/**'
-      - 'OF-Scraper-3.14.7/**'
+      - 'patch_ofscraper_*_gui.py'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
@@ -39,14 +39,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=3.14.7,enable={{is_default_branch}}
+            type=raw,value=3.14.7-p422,enable={{is_default_branch}}
             type=sha,prefix=
-
-      - name: Stage patch scripts into version dirs (upstream Dockerfile expects them there)
-        run: |
-          for v in 3.12.9 3.14.3 3.14.5 3.14.7; do
-            cp "patch_ofscraper_${v}_gui.py" "OF-Scraper-${v}/"
-          done
 
       - name: Build and push
         uses: docker/build-push-action@v6

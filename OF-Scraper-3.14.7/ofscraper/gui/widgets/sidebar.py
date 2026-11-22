@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
 )
 
+from ofscraper.gui.styles import c
 from ofscraper.gui.utils.ui_scale import apply_font
 from ofscraper.gui.signals import app_signals
 from ofscraper.gui.utils.group_layout import compact_group, tune_group_layout
@@ -41,18 +42,18 @@ def _make_help_btn(anchor: str) -> QToolButton:
     b.setAutoRaise(True)
     b.setFixedSize(18, 18)
     b.setStyleSheet(
-        """
-        QToolButton {
-            border: 1px solid #45475a;
+        f"""
+        QToolButton {{
+            border: 1px solid {c('surface1')};
             border-radius: 9px;
-            background-color: #313244;
-            color: #cdd6f4;
+            background-color: {c('surface0')};
+            color: {c('text')};
             font-weight: bold;
-        }
-        QToolButton:hover {
-            border-color: #89b4fa;
-            background-color: #45475a;
-        }
+        }}
+        QToolButton:hover {{
+            border-color: {c('blue')};
+            background-color: {c('surface1')};
+        }}
         """
     )
     b.clicked.connect(lambda: app_signals.help_anchor_requested.emit(anchor))
@@ -363,6 +364,10 @@ class FilterSidebar(QWidget):
         text_layout.addLayout(text_row)
         self.fullstring_check = QCheckBox("Full string match")
         text_layout.addWidget(self.fullstring_check)
+        # Clearing the search shows the rows again without Apply Filters; other
+        # filter changes still wait for the button.
+        self._last_search_text = ""
+        self.text_input.textChanged.connect(self._on_search_text_changed)
         layout.addWidget(text_group)
 
         # -- Media type (same single-row pattern as Areas → Media Types) --
@@ -627,7 +632,7 @@ class FilterSidebar(QWidget):
         self.min_time = QTimeEdit()
         self.min_time.setDisplayFormat("HH:mm:ss")
         self.min_time.setSpecialValueText("No min")
-        self.min_time.setMinimumWidth(100)
+        self.min_time.setMinimumWidth(84)
         _fit_h(self.min_time)
         length_row.addWidget(_expanding(self.min_time), 1)
         _max_lbl = QLabel("Max:")
@@ -636,7 +641,7 @@ class FilterSidebar(QWidget):
         self.max_time = QTimeEdit()
         self.max_time.setDisplayFormat("HH:mm:ss")
         self.max_time.setSpecialValueText("No max")
-        self.max_time.setMinimumWidth(100)
+        self.max_time.setMinimumWidth(84)
         _fit_h(self.max_time)
         length_row.addWidget(_expanding(self.max_time), 1)
         self.length_enabled = QCheckBox("Enable")
@@ -668,7 +673,7 @@ class FilterSidebar(QWidget):
         self.price_min.setRange(0, 99999)
         self.price_min.setSpecialValueText("No min")
         self.price_min.setDecimals(2)
-        self.price_min.setMinimumWidth(100)
+        self.price_min.setMinimumWidth(84)
         _fit_h(self.price_min)
         price_row.addWidget(_expanding(self.price_min), 1)
         _pmax_lbl = QLabel("Max:")
@@ -678,7 +683,7 @@ class FilterSidebar(QWidget):
         self.price_max.setRange(0, 99999)
         self.price_max.setSpecialValueText("No max")
         self.price_max.setDecimals(2)
-        self.price_max.setMinimumWidth(100)
+        self.price_max.setMinimumWidth(84)
         _fit_h(self.price_max)
         price_row.addWidget(_expanding(self.price_max), 1)
         # Same slot as Duration's Enable so the Max fields line up vertically.
@@ -953,6 +958,12 @@ class FilterSidebar(QWidget):
             import logging
 
             logging.getLogger("shared").debug(f"[GUI] Load filter preset failed: {e}")
+
+    def _on_search_text_changed(self, text):
+        was = self._last_search_text
+        self._last_search_text = text.strip()
+        if was and not self._last_search_text:
+            self.filter_changed.emit()
 
     def _restore_last_used_preset(self):
         """On sidebar create, load and apply the last-used preset if any."""

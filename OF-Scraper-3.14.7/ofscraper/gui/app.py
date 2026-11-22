@@ -1,22 +1,43 @@
 import os
 import random
 
-# Pre-allocate debugging port and set environment variables before importing PyQt6.
+# Chromium flags for the embedded login browser, set before importing PyQt6.
 # This is critical because importing PyQt6 modules or submodules can trigger
 # early initialization of the WebEngine library, ignoring later environment changes.
-if "QTWEBENGINE_CHROMIUM_FLAGS" not in os.environ:
-    port = random.randint(9200, 9299)
-    os.environ["OFSCRAPER_WEBENGINE_DEBUG_PORT"] = str(port)
-    os.environ["QTWEBENGINE_REMOTE_DEBUGGING"] = str(port)
-    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+#
+# Remote debugging (the login dialog's DevTools button) lets any program on this
+# computer control that browser, so it is off unless OFSCRAPER_GUI_WEBENGINE_DEBUG=1.
+WEBENGINE_DEBUG_ENV = "OFSCRAPER_GUI_WEBENGINE_DEBUG"
+_BASE_WEBENGINE_FLAGS = (
+    "--disable-blink-features=AutomationControlled "
+    "--disable-features=StorageAccessAPI"
+)
+
+
+def webengine_debug_enabled() -> bool:
+    return os.environ.get(WEBENGINE_DEBUG_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def webengine_flags() -> str:
+    """Chromium flags for this run; with debugging on, also picks the port."""
+    if not webengine_debug_enabled():
+        os.environ.pop("OFSCRAPER_WEBENGINE_DEBUG_PORT", None)
+        return _BASE_WEBENGINE_FLAGS
+    port = os.environ.get("OFSCRAPER_WEBENGINE_DEBUG_PORT") or str(random.randint(9200, 9299))
+    os.environ["OFSCRAPER_WEBENGINE_DEBUG_PORT"] = port
+    os.environ["QTWEBENGINE_REMOTE_DEBUGGING"] = port
+    return (
         f"--remote-debugging-port={port} "
-        "--remote-allow-origins=* "
-        "--disable-blink-features=AutomationControlled "
-        "--disable-web-security "
-        "--allow-running-insecure-content "
-        "--disable-features=StorageAccessAPI"
+        f"--remote-allow-origins=http://localhost:{port},http://127.0.0.1:{port} "
+        + _BASE_WEBENGINE_FLAGS
     )
 
+
+_WEBENGINE_FLAGS = webengine_flags()
+if "QTWEBENGINE_CHROMIUM_FLAGS" not in os.environ:
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = _WEBENGINE_FLAGS
+
+import atexit
 import logging
 import subprocess
 import sys
@@ -286,6 +307,35 @@ def _is_docker() -> bool:
     return False
 
 
+def enable_rhi_widgets(platform: str = sys.platform, docker: bool = False) -> None:
+    """On Windows and Linux, draw every window with the GPU (RHI) from the start.
+
+    The login browser (QWebEngineView) needs RHI drawing. Without this, Qt
+    switches the windows over when the browser first opens, and the whole GUI
+    flashes. Docker has no GPU, so it is left alone (the login browser runs
+    there with --disable-gpu instead).
+    Set QT_WIDGETS_RHI=0 to turn it off.
+    """
+    if not docker and (platform == "win32" or platform.startswith("linux")):
+        os.environ.setdefault("QT_WIDGETS_RHI", "1")
+
+
+def _make_gui_log_handler() -> GUILogHandler:
+    """Handler that forwards log lines to the GUI console.
+
+    Uses the same masking as the log file, so the session cookie and other
+    secrets are hidden in the console with Privacy mode on or off. The
+    handler strips Rich tags itself.
+    """
+    from ofscraper.utils.logs.classes.classes import SensitiveFormatter
+
+    handler = GUILogHandler()
+    handler.setFormatter(
+        SensitiveFormatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+    )
+    return handler
+
+
 def launch_gui(manager=None):
     """Launch the PyQt6 GUI application."""
     # Tell Windows to use our own AppUserModelID so the taskbar shows our
@@ -317,6 +367,9 @@ def launch_gui(manager=None):
             )
         log.info("[GUI] Docker environment detected — software rendering enabled")
 
+    # Must be set before QApplication exists.
+    enable_rhi_widgets(docker=_is_docker())
+
     # QtWebEngineWidgets requires AA_ShareOpenGLContexts to be set before
     # QApplication is created.  Set it unconditionally; it's a no-op when
     # WebEngine is absent.
@@ -330,18 +383,9 @@ def launch_gui(manager=None):
     # This acts as a robust backup to environment variables.
     # Note: Qt WebEngine expects all Chromium flags to be passed as a single
     # space-separated string argument following the '--webEngineArgs' parameter.
-    port_str = os.environ.get("OFSCRAPER_WEBENGINE_DEBUG_PORT", "9208")
-    flags_str = (
-        f"--remote-debugging-port={port_str} "
-        "--remote-allow-origins=* "
-        "--disable-blink-features=AutomationControlled "
-        "--disable-web-security "
-        "--allow-running-insecure-content "
-        "--disable-features=StorageAccessAPI"
-    )
     sys.argv.extend([
         "--webEngineArgs",
-        flags_str
+        _WEBENGINE_FLAGS
     ])
 
     app = QApplication(sys.argv)
@@ -418,10 +462,7 @@ def launch_gui(manager=None):
         log.warning(f"Could not install GUI interaction event filter: {e}")
 
     # Attach GUI log handler to forward logs to the console widget
-    gui_handler = GUILogHandler()
-    gui_handler.setFormatter(
-        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
-    )
+    gui_handler = _make_gui_log_handler()
     # Hook both loggers used by the scraper
     for logger_name in ["shared", "shared_other"]:
         target_logger = logging.getLogger(logger_name)
@@ -447,6 +488,14 @@ def launch_gui(manager=None):
 
     window = MainWindow(manager=manager)
     window.show()
+
+    # docker stop / SIGTERM: cancel the scrape and quit instead of dying mid-write.
+    try:
+        from ofscraper.gui.utils.shutdown import install_sigterm_handler
+
+        install_sigterm_handler(app, window.workflow)
+    except Exception as e:
+        log.warning(f"Could not install SIGTERM handler: {e}")
 
     # Set up a persistent system tray icon for notifications.
     # Must be created on the main thread and kept alive for the app lifetime.
@@ -492,4 +541,93 @@ def launch_gui(manager=None):
     except Exception:
         _patch_ver = "unknown"
     log.info(f"OF-Scraper {_of_ver} GUI {_patch_ver} started")
+
+    # Python can also exit without app.exec() returning (e.g. SystemExit in a
+    # Qt callback); PyQt's own exit cleanup then walks a live app. atexit runs
+    # newest first: this runs before PyQt's cleanup, and after the
+    # python_exit breadcrumb registered just below.
+    atexit.register(shutdown_gui, app, window, 1000)
+    try:
+        from ofscraper.gui.utils.crash_diagnostics import install_exit_tracing
+
+        install_exit_tracing(app)
+    except Exception as e:
+        log.debug(f"[GUI] exit tracing not installed: {e}")
+
     app.exec()
+    try:
+        from ofscraper.gui.utils.crash_diagnostics import gui_action
+
+        gui_action("event_loop_exited")
+    except Exception:
+        pass
+    shutdown_gui(app, window)
+
+
+def shutdown_gui(app, window, worker_wait_ms: int = 5000) -> None:
+    """Take the GUI down in a fixed order before QApplication is destroyed.
+
+    PyQt's QApplication destructor walks sip's table of every wrapper and deletes
+    the Python-owned QObjects (the main window and its whole widget tree),
+    releasing the GIL for each delete. Python that runs meanwhile (the app-wide
+    event filters see every widget being destroyed; worker threads keep going)
+    adds and removes wrappers, sip rebuilds the table, and the walk reads freed
+    memory: a Windows access violation in sip.cp311-win_amd64.pyd
+    (sip_api_visit_wrappers) when the GUI closes. So: unload plugins, drop the
+    Python event filters, let pool workers finish, and delete the window here,
+    leaving that walk almost nothing to do. Safe to call twice (it also runs
+    from atexit).
+    """
+    if getattr(app, "_ofs_gui_shut_down", False):
+        return
+    try:
+        app._ofs_gui_shut_down = True
+    except Exception:
+        pass
+    try:
+        from ofscraper.gui.utils.crash_diagnostics import gui_action
+
+        gui_action("shutdown_start")
+    except Exception:
+        gui_action = None
+
+    # Plugins never got on_unload at exit (only via Plugins → Unload now), so
+    # e.g. a running live capture was never told to save.
+    try:
+        from ofscraper.plugins.manager import plugin_manager
+
+        plugin_manager.dispatch_event("on_ui_teardown", window)
+        plugin_manager.dispatch_event("on_unload")
+    except Exception as e:
+        log.debug(f"[GUI] plugin shutdown failed: {e}")
+
+    for attr in ("_gui_event_logger", "_legacy_model_loading_popup_filter"):
+        flt = getattr(app, attr, None)
+        if flt is not None:
+            try:
+                app.removeEventFilter(flt)
+            except Exception:
+                pass
+
+    try:
+        from PyQt6.QtCore import QThreadPool
+
+        if not QThreadPool.globalInstance().waitForDone(int(worker_wait_ms)):
+            log.debug("[GUI] background workers still running at exit")
+    except Exception:
+        pass
+
+    try:
+        from PyQt6 import sip
+
+        if window is not None and not sip.isdeleted(window):
+            sip.delete(window)
+        app.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+    except Exception as e:
+        log.debug(f"[GUI] window teardown failed: {e}")
+
+    if gui_action is not None:
+        try:
+            gui_action("shutdown_done")
+        except Exception:
+            pass

@@ -19,7 +19,10 @@ from ofscraper.managers.sessionmanager.sessionmanager import (
 # Imports for the new session classes
 import ofscraper.commands.scraper.actions.utils.globals as common_globals
 from ofscraper.commands.scraper.actions.utils.retries import get_download_req_retries
-from ofscraper.commands.scraper.actions.download.utils.leaky import LeakyBucket
+from ofscraper.commands.scraper.actions.download.utils.leaky import (
+    LeakyBucket,
+    warn_if_limit_looks_too_low,
+)
 import ofscraper.utils.settings as settings
 from ofscraper.commands.scraper.actions.download.utils.chunk import get_chunk_timeout
 from ofscraper.managers.sessionmanager.sleepers import (
@@ -145,11 +148,22 @@ class download_session(sessionManager):
         **kwargs: Any,
     ) -> None:
         # --- Apply specialized defaults for download sessions ---
-        retries = kwargs.pop("retries", None) or get_download_req_retries()
-        wait_min = kwargs.pop("wait_min", None) or of_env.getattr("OF_MIN_WAIT_API")
-        wait_max = kwargs.pop("wait_max", None) or of_env.getattr("OF_MAX_WAIT_API")
-        read_timeout = kwargs.pop("read_timeout", None) or get_chunk_timeout()
+        # only None means "use the default": 0 tries, a 0 s wait or a read
+        # timeout of 0 (no limit, mapped to None by sessionManager) is a value
+        retries = kwargs.pop("retries", None)
+        if retries is None:
+            retries = get_download_req_retries()
+        wait_min = kwargs.pop("wait_min", None)
+        if wait_min is None:
+            wait_min = of_env.getattr("OF_MIN_WAIT_API")
+        wait_max = kwargs.pop("wait_max", None)
+        if wait_max is None:
+            wait_max = of_env.getattr("OF_MAX_WAIT_API")
+        read_timeout = kwargs.pop("read_timeout", None)
+        if read_timeout is None:
+            read_timeout = get_chunk_timeout()
         log = kwargs.pop("log", None) or common_globals.log
+        warn_if_limit_looks_too_low()
         self.leaky_bucket = LeakyBucket(settings.get_settings().download_limit, 1)
 
         super().__init__(
@@ -179,13 +193,13 @@ class download_session(sessionManager):
         async with super().requests_async(*args, **kwargs) as r:
             yield r
 
-    async def _httpx_funct_async(self, *args, **kwargs):
+    async def _aio_funct(self, *args, **kwargs):
         """Wraps the parent method to add download speed limiting to chunk iteration."""
-        t = await super()._httpx_funct_async(*args, **kwargs)
+        t = await super()._aio_funct(*args, **kwargs)
 
-        # Override chunk iterators to use the leaky bucket
+        # Override the chunk iterator to use the leaky bucket. iter_chunks is
+        # left alone: it yields (data, end_of_chunk) tuples and nothing uses it.
         t.iter_chunked = self.chunk_with_limit(t.iter_chunked)
-        t.iter_chunks = self.chunk_with_limit(t.iter_chunks)
         return t
 
     def chunk_with_limit(self, funct):
@@ -238,28 +252,7 @@ class metadata_session(download_session):
         async with super().requests_async(*args, **kwargs) as r:
             yield r
 
-    async def _httpx_funct_async(self, *args, **kwargs):
-        """Wraps the parent method to add download speed limiting to chunk iteration."""
-        t = await super()._httpx_funct_async(*args, **kwargs)
-
-        # Override chunk iterators to use the leaky bucket
-        t.iter_chunked = self.chunk_with_limit(t.iter_chunked)
-        t.iter_chunks = self.chunk_with_limit(t.iter_chunks)
-        return t
-
-    def chunk_with_limit(self, funct):
-        """Decorator to apply the leaky bucket to an async chunk generator."""
-
-        async def wrapper(*args, **kwargs):
-            async for chunk in funct(*args, **kwargs):
-                await self.get_token(len(chunk))
-                yield chunk
-
-        return wrapper
-
-    async def get_token(self, size: int):
-        """Acquires tokens from the leaky bucket corresponding to the chunk size."""
-        await self.leaky_bucket.acquire(size)
+    # the speed limit is inherited from download_session
 
 
 class cdm_session(sessionManager):

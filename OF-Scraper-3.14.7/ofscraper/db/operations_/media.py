@@ -20,6 +20,7 @@ import arrow
 from rich.console import Console
 
 import ofscraper.db.operations_.wrapper as wrapper
+import ofscraper.db.utils.rebuild as rebuild
 from ofscraper.db.operations_.profile import get_single_model_via_profile
 from ofscraper.utils.context.run_async import run
 
@@ -72,9 +73,6 @@ END AS duration
 FROM medias;
 """
 
-mediaDrop = """
-drop table medias;
-"""
 mediaUpdateAPI = """Update 'medias'
 SET
 media_id=?,post_id=?,link=?,linked=?,api_type=?,media_type=?,preview=?,created_at=?,posted_at=?,model_id=?,duration=?,unlocked=?
@@ -156,12 +154,20 @@ SELECT media_id, post_id FROM medias
 allPostIDDLCheck = """
 SELECT media_id, post_id FROM medias where downloaded=(1)
 """
+downloadedMediaPaths = """
+SELECT media_id, post_id, directory, filename FROM medias where downloaded=(1)
+"""
 getTimelineMedia = """
 SELECT
 media_id,post_id,link,directory,
 filename,size,api_type,media_type,
 preview,linked,downloaded,created_at,posted_at,hash,model_id,unlocked,duration
 FROM medias where LOWER(api_type) in ('timeline','posts','post') and model_id=(?)
+"""
+getModelMediaStatus = """
+SELECT
+media_id,post_id,media_type,downloaded,unlocked
+FROM medias where model_id=(?)
 """
 getArchivedMedia = """
 SELECT
@@ -360,6 +366,22 @@ def get_media_post_ids_downloaded(
 
 
 @wrapper.operation_wrapper
+def get_downloaded_media_paths(
+    model_id=None, username=None, conn=None, **kwargs
+) -> dict:
+    """{(media_id, post_id): (directory, filename)} for downloaded media."""
+    with contextlib.closing(conn.cursor()) as cur:
+        cur.execute(downloadedMediaPaths)
+        return {
+            (dict(row)["media_id"], dict(row)["post_id"]): (
+                dict(row)["directory"],
+                dict(row)["filename"],
+            )
+            for row in cur.fetchall()
+        }
+
+
+@wrapper.operation_wrapper
 def get_dupe_media_hashes(
     model_id=None, username=None, conn=None, mediatype=None, **kwargs
 ) -> list:
@@ -471,32 +493,46 @@ def update_media_table_via_api_batch(
         conn.commit()
 
 
+def media_transition_rows(inputData) -> list:
+    ordered_keys = [
+        "media_id",
+        "post_id",
+        "link",
+        "directory",
+        "filename",
+        "size",
+        "api_type",
+        "media_type",
+        "preview",
+        "linked",
+        "downloaded",
+        "created_at",
+        "posted_at",
+        "hash",
+        "model_id",
+        "duration",
+        "unlocked",
+    ]
+    inputData = _media_cleaup_helper(inputData)
+    return [tuple([data[key] for key in ordered_keys]) for data in inputData]
+
+
 @wrapper.operation_wrapper_async
 def write_media_table_transition(inputData, model_id=None, conn=None, **kwargs):
     with contextlib.closing(conn.cursor()) as curr:
-        ordered_keys = [
-            "media_id",
-            "post_id",
-            "link",
-            "directory",
-            "filename",
-            "size",
-            "api_type",
-            "media_type",
-            "preview",
-            "linked",
-            "downloaded",
-            "created_at",
-            "posted_at",
-            "hash",
-            "model_id",
-            "duration",
-            "unlocked",
-        ]
-        inputData = _media_cleaup_helper(inputData)
-        insertData = [tuple([data[key] for key in ordered_keys]) for data in inputData]
-        curr.executemany(mediaInsertTransition, insertData)
+        curr.executemany(mediaInsertTransition, media_transition_rows(inputData))
         conn.commit()
+
+
+@wrapper.operation_wrapper_async
+def replace_media_table(inputData, model_id=None, conn=None, **kwargs):
+    rebuild.replace_table(
+        conn,
+        "medias",
+        mediaCreate,
+        mediaInsertTransition,
+        media_transition_rows(inputData),
+    )
 
 
 def _media_cleaup_helper(inputData):
@@ -536,13 +572,6 @@ async def get_all_medias(model_id=None, username=None, database_model=None, **kw
     return await get_all_medias_transition(
         model_id=model_id, username=username, database_model=database_model, **kwargs
     )
-
-
-@wrapper.operation_wrapper_async
-def drop_media_table(model_id=None, username=None, conn=None, **kwargs) -> list:
-    with contextlib.closing(conn.cursor()) as cur:
-        cur.execute(mediaDrop)
-        conn.commit()
 
 
 @run
@@ -659,6 +688,14 @@ def get_timeline_media(model_id=None, username=None, conn=None, **kwargs) -> lis
         ]
 
 
+@run
+@wrapper.operation_wrapper_async
+def get_model_media_status(model_id=None, username=None, conn=None, **kwargs) -> list:
+    with contextlib.closing(conn.cursor()) as cur:
+        cur.execute(getModelMediaStatus, [model_id])
+        return [dict(row) for row in cur.fetchall()]
+
+
 def update_media_table_via_api_helper(
     media, model_id=None, conn=None, curr=None, **kwargs
 ) -> list:
@@ -773,9 +810,7 @@ async def rebuild_media_table(model_id=None, username=None, db_path=None, **kwar
         database_model=database_model,
         db_path=db_path,
     )
-    await drop_media_table(model_id=model_id, username=username, db_path=db_path)
-    await create_media_table(model_id=model_id, username=username, db_path=db_path)
-    await write_media_table_transition(
+    await replace_media_table(
         data, model_id=model_id, username=username, db_path=db_path
     )
 

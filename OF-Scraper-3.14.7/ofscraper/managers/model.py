@@ -1,6 +1,8 @@
 import logging
 from typing import Dict, List, Optional, Set, Union, Iterable
 
+from ofscraper.utils.markup import escape_text
+
 import ofscraper.data.models.utils.retriver as retriver
 import ofscraper.filters.models.date as date_
 import ofscraper.filters.models.flags as flags
@@ -261,7 +263,7 @@ class ModelManager:
 
         Note: This is NOT used by 'add_models' (Check modes), which injects targets directly.
         """
-        usernames = settings.get_settings().usernames
+        usernames = settings.get_settings().usernames or []
         is_daemon = settings.get_settings().daemon
 
         # Guard Clause 1: Daemon mode with a specific list of users.
@@ -367,7 +369,7 @@ class ModelManager:
                         new_args = settings.get_args(copy=True)
 
             except Exception as e:
-                console.get_console().print(f"Exception in menu: {e}")
+                console.get_console().print(f"Exception in menu: {escape_text(e)}")
             settings.update_args(new_args)
 
     def get_models_from_prompt(self):
@@ -391,7 +393,10 @@ class ModelManager:
 
     def _apply_filters(self) -> List["Model"]:
         """Runs the loaded models through the gauntlet of configured filters."""
-        models = self.all_subs
+        # --scrape-paid adds placeholders for deleted accounts; only the paid
+        # pass can use them, so keep them out of the normal scrape
+        placeholder = of_env.getattr("DELETED_MODEL_PLACEHOLDER")
+        models = [m for m in self.all_subs if not str(m.name).startswith(placeholder)]
         models = subtype.subType(models)
         models = price.pricePaidFreeFilterHelper(models)
         models = flags.promoFilterHelper(models)

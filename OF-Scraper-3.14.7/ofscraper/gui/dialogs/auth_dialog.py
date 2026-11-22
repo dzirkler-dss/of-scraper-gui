@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ofscraper.gui.signals import app_signals
-from ofscraper.gui.utils.ui_scale import apply_font, scale_px
+from ofscraper.gui.utils.ui_scale import apply_font, scale_px, style_page_title
 from ofscraper.gui.styles import c
 from ofscraper.gui.widgets.styled_button import StyledButton
 import ofscraper.utils.paths.common as common_paths
@@ -2857,7 +2857,8 @@ def _validate_of_credentials(creds: dict) -> "tuple[bool | None, str]":
     import asyncio as _aio
 
     from ofscraper.gui.utils.auth_errors import (
-        format_cred_test_failure,
+        cred_test_failure,
+        cred_test_timeout,
         wrong_user_help_message,
     )
 
@@ -2910,9 +2911,12 @@ def _validate_of_credentials(creds: dict) -> "tuple[bool | None, str]":
         import ofscraper.data.api.me as _me
         user_info = None
         try:
+            # fetch the dynamic rule once, with its own retries. Otherwise
+            # each retry of /me fetches it again from every rule host
+            _auth_req.read_request_auth()
             user_info = _me.scrape_user()
         except Exception as e:
-            return False, format_cred_test_failure(e)
+            return cred_test_failure(e)
 
         if not user_info or not isinstance(user_info, dict):
             return False, wrong_user_help_message(
@@ -2941,24 +2945,32 @@ def _validate_of_credentials(creds: dict) -> "tuple[bool | None, str]":
         # If credentials succeeded, set _old_auth to None so they stay saved!
         _old_auth = None
 
+        # Privacy mode: the account's display name and @username are hidden
+        # (this text is shown in a dialog and in the status bar).
+        try:
+            from ofscraper.gui.utils.privacy_mode import mask_username
+
+            acct_name = mask_username(user_info.get("name", "")) or ""
+            acct_user = mask_username(user_info.get("username", "")) or ""
+        except Exception:
+            acct_name = user_info.get("name", "")
+            acct_user = user_info.get("username", "")
+
         if models:
             return True, (
                 f"Credentials valid — loaded {len(models)} model(s) successfully.\n\n"
-                f"Logged in as: {user_info.get('name', '')} (@{user_info.get('username', '')})"
+                f"Logged in as: {acct_name} (@{acct_user})"
             )
         else:
             return True, (
-                f"Credentials valid for @{user_info.get('username', '')}.\n"
+                f"Credentials valid for @{acct_user}.\n"
                 "Note: No active model subscriptions were returned."
             )
 
     except _aio.TimeoutError:
-        return False, (
-            "Timed out waiting for model list — OnlyFans did not respond in 45 s.\n"
-            "Check your internet connection or try again."
-        )
+        return cred_test_timeout()
     except Exception as e:
-        return False, format_cred_test_failure(e)
+        return cred_test_failure(e)
 
     finally:
         # Always restore original auth.json ONLY IF test failed
@@ -2970,7 +2982,8 @@ def _validate_of_credentials(creds: dict) -> "tuple[bool | None, str]":
 
 
 class _CredTestWorker(QThread):
-    # success: True=valid, False=invalid, None=inconclusive
+    # success: True=valid, False=invalid, None=inconclusive,
+    # CRED_TEST_UNAVAILABLE=couldn't be checked (network or server problem)
     result_ready = pyqtSignal(object, str)
 
     def __init__(self, creds: dict, parent=None):
@@ -3379,8 +3392,9 @@ _USE_CDP = False
 _WEBENGINE_DEBUG_PORT: "int | None" = None
 
 
-def _get_or_create_debug_port() -> int:
-    """Return the Chromium remote-debugging port allocated at startup."""
+def _get_or_create_debug_port() -> "int | None":
+    """Return the Chromium remote-debugging port allocated at startup, or None
+    when debugging is off (see OFSCRAPER_GUI_WEBENGINE_DEBUG in gui/app.py)."""
     global _WEBENGINE_DEBUG_PORT
     if _WEBENGINE_DEBUG_PORT is None:
         port_str = os.environ.get("OFSCRAPER_WEBENGINE_DEBUG_PORT")
@@ -3388,15 +3402,7 @@ def _get_or_create_debug_port() -> int:
             try:
                 _WEBENGINE_DEBUG_PORT = int(port_str)
             except Exception:
-                _WEBENGINE_DEBUG_PORT = 9208
-        else:
-            import random
-            _WEBENGINE_DEBUG_PORT = random.randint(9200, 9299)
-            existing = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
-            flags = "--disable-blink-features=AutomationControlled"
-            if _USE_CDP:
-                flags = f"--remote-debugging-port={_WEBENGINE_DEBUG_PORT} " + flags
-            os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = f"{existing} {flags}".strip()
+                return None
     return _WEBENGINE_DEBUG_PORT
 
 
@@ -4031,7 +4037,7 @@ class BrowserLoginDialog(QDialog):
         # CDP listener — connects to Chromium's remote debugging endpoint and
         # captures x-bc from the actual network-layer headers (including those
         # added by service workers, which JS injection in the main world misses).
-        if self._use_cdp:
+        if self._use_cdp and self._debug_port:
             self._cdp_listener = _CDPListener(self._debug_port, self)
             self._cdp_listener.xbc_captured.connect(self._on_cdp_xbc)
             self._cdp_listener.start()
@@ -4085,7 +4091,7 @@ class BrowserLoginDialog(QDialog):
         footer_layout.addWidget(self._login_status_lbl)
 
         sep = QLabel("|")
-        sep.setStyleSheet(f"color: #45475a; font-size: {scale_px(11)}px;")
+        sep.setStyleSheet(f"color: {c('surface2')}; font-size: {scale_px(11)}px;")
         footer_layout.addWidget(sep)
 
         for label_key, display in [
@@ -4095,7 +4101,7 @@ class BrowserLoginDialog(QDialog):
             ("user_agent", "user-agent"),
         ]:
             lbl = QLabel(f"{display}: —")
-            lbl.setStyleSheet(f"color: #6c7086; font-size: {scale_px(11)}px; font-family: monospace;")
+            lbl.setStyleSheet(f"color: {c('muted')}; font-size: {scale_px(11)}px; font-family: monospace;")
             self._status_labels[label_key] = lbl
             footer_layout.addWidget(lbl)
 
@@ -4323,7 +4329,7 @@ class BrowserLoginDialog(QDialog):
             lbl = self._status_labels.get("x-bc")
             if lbl:
                 lbl.setText("x-bc: —")
-                lbl.setStyleSheet(f"color: #6c7086; font-size: {scale_px(11)}px; font-family: monospace;")
+                lbl.setStyleSheet(f"color: {c('muted')}; font-size: {scale_px(11)}px; font-family: monospace;")
             self._refresh_import_btn()
 
     def _open_devtools(self):
@@ -4335,6 +4341,17 @@ class BrowserLoginDialog(QDialog):
         """
         from PyQt6.QtGui import QDesktopServices as _QDS
         from PyQt6.QtCore import QUrl as _QUrl
+        if not self._debug_port:
+            QMessageBox.information(
+                self,
+                "DevTools is off",
+                "DevTools needs remote debugging, which is off because any program "
+                "on this computer could use it to control this login window.\n\n"
+                "To turn it on for one session, set the environment variable\n"
+                "OFSCRAPER_GUI_WEBENGINE_DEBUG=1 and restart the GUI.\n\n"
+                "Or copy x-bc from your normal browser's DevTools instead.",
+            )
+            return
         url = f"http://localhost:{self._debug_port}"
         _QDS.openUrl(_QUrl(url))
 
@@ -4355,7 +4372,7 @@ class BrowserLoginDialog(QDialog):
         for key, lbl in self._status_labels.items():
             disp = "user-agent" if key == "user_agent" else key
             lbl.setText(f"{disp}: —")
-            lbl.setStyleSheet(f"color: #6c7086; font-size: {scale_px(11)}px; font-family: monospace;")
+            lbl.setStyleSheet(f"color: {c('muted')}; font-size: {scale_px(11)}px; font-family: monospace;")
         if hasattr(self, "_xbc_input"):
             self._xbc_input.blockSignals(True)
             self._xbc_input.clear()
@@ -4365,9 +4382,11 @@ class BrowserLoginDialog(QDialog):
         if self._cdp_listener:
             self._cdp_listener.stop()
             self._cdp_listener.wait(1000)
-        self._cdp_listener = _CDPListener(self._debug_port, self)
-        self._cdp_listener.xbc_captured.connect(self._on_cdp_xbc)
-        self._cdp_listener.start()
+            self._cdp_listener = None
+        if self._debug_port:
+            self._cdp_listener = _CDPListener(self._debug_port, self)
+            self._cdp_listener.xbc_captured.connect(self._on_cdp_xbc)
+            self._cdp_listener.start()
         # deleteAllCookies / clearHttpCache are async — delay the reload so
         # they complete before the new page load picks up fresh cookies.
         if self._view:
@@ -4622,7 +4641,7 @@ class AuthPage(QWidget):
         small screens do not crush the form; Save/Test stay pinned below.
         """
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 16, 24, 12)
+        root.setContentsMargins(24, 24, 24, 12)
         root.setSpacing(8)
 
         scroll = QScrollArea()
@@ -4639,8 +4658,7 @@ class AuthPage(QWidget):
 
         # Header
         header = QLabel("Authentication")
-        apply_font(header, "Segoe UI", 20, QFont.Weight.Bold)
-        header.setProperty("heading", True)
+        style_page_title(header)
         layout.addWidget(header)
 
         subtitle = QLabel(
@@ -5122,6 +5140,8 @@ class AuthPage(QWidget):
         self._test_progress_dlg.exec()
 
     def _on_test_done(self, success, message: str):
+        from ofscraper.gui.utils.auth_errors import CRED_TEST_UNAVAILABLE
+
         # Close the progress dialog before showing the result.
         try:
             if hasattr(self, "_test_progress_dlg") and self._test_progress_dlg is not None:
@@ -5139,43 +5159,22 @@ class AuthPage(QWidget):
             # Inconclusive — credentials likely valid but session state mismatch
             app_signals.status_message.emit("Credentials test inconclusive — likely valid")
             QMessageBox.information(self, "Credentials Appear Valid", message)
+        elif success == CRED_TEST_UNAVAILABLE:
+            # a network or server problem: says nothing about the credentials
+            app_signals.status_message.emit(
+                "Couldn't check credentials — network or server problem"
+            )
+            QMessageBox.warning(self, "Couldn't Check Credentials", message)
         else:
             app_signals.status_message.emit(f"Credentials failed — {message}")
             QMessageBox.warning(self, "Credentials Invalid", message)
 
-    @staticmethod
-    def _is_docker() -> bool:
-        """Return True when running inside a Docker / OCI container."""
-        if os.path.exists("/.dockerenv"):
-            return True
-        try:
-            with open("/proc/1/cgroup", errors="ignore") as _f:
-                _c = _f.read()
-                return "docker" in _c or "containerd" in _c
-        except OSError:
-            pass
-        return False
-
     def _open_browser_login(self):
         """Open embedded browser login dialog and populate fields from captured credentials."""
-        # QtWebEngine (Chromium) cannot run reliably in Docker — no GPU and
-        # Docker's default 64 MB /dev/shm causes an immediate Chromium crash.
-        if self._is_docker():
-            QMessageBox.information(
-                self,
-                "Login in Browser — Not Supported in Docker",
-                "The embedded browser login is not available when running inside Docker.\n\n"
-                "To authenticate, copy your credentials manually from your browser:\n\n"
-                "1. Open OnlyFans in your regular browser and log in\n"
-                "2. Press F12 → Network tab → click any OnlyFans API request\n"
-                "3. Copy the following from the request headers:\n"
-                "     • cookie: sess=…  (the sess value)\n"
-                "     • cookie: auth_id=…  (the auth_id value)\n"
-                "     • user-agent\n"
-                "     • x-bc\n"
-                "4. Paste each value into the fields above",
-            )
-            return
+        # Works in Docker too: launch_gui() starts Chromium with --disable-gpu
+        # --no-sandbox --disable-dev-shm-usage there, so it needs no GPU and
+        # doesn't depend on /dev/shm size. It is the only browser login in the
+        # container (no desktop browser to import from or launch).
         try:
             dlg = BrowserLoginDialog(self)
         except ImportError as e:

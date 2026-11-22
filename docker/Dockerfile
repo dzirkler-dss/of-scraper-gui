@@ -1,7 +1,7 @@
 FROM ubuntu:24.04
 
 # Build arg: which version of ofscraper + GUI patch to use.
-# Must match one of the OF-Scraper-X.X.X/patch_ofscraper_X.X.X_gui.py files.
+# Must match one of the patch_ofscraper_X.X.X_gui.py files in the repo root.
 ARG GUI_PATCH_VERSION=3.14.7
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -23,18 +23,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-venv python3-dev \
     # PyQt6 from apt — uses Ubuntu's system Qt, correctly linked to xcb libs
     python3-pyqt6 python3-pyqt6.qtwebengine \
-    # Virtual display
-    xvfb \
+    # Virtual display + VNC server in one (TigerVNC Xvnc). Unlike Xvfb + x11vnc,
+    # it accepts screen-size requests from the viewer, so noVNC's resize=remote
+    # makes the desktop match the browser window. Also syncs the clipboard.
+    tigervnc-standalone-server \
     # Minimal window manager so Qt windows don't get orphaned
     fluxbox \
-    # VNC server
-    x11vnc \
     # noVNC dependencies
     novnc websockify \
     # Qt xcb platform dependencies
     libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
     libxcb-render-util0 libxcb-xinerama0 libxcb-xkb1 libxkbcommon-x11-0 \
     libegl1 libgl1 libfontconfig1 libdbus-1-3 \
+    # Color emoji font (~11 MB). The base image has none, so the GUI's emoji
+    # icons (sidebar, buttons, plugin pages) showed as empty boxes.
+    fonts-noto-color-emoji \
     # Audio stub (prevents Qt from logging warnings)
     libasound2t64 \
     # ffmpeg — installed natively so all shared libraries (libavdevice etc.) are present.
@@ -43,7 +46,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # decryption to silently fail and leaving every video stuck as a .part file.
     ffmpeg \
     # Utilities
-    curl wget ca-certificates git xdotool \
+    curl wget ca-certificates git xdotool wmctrl \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Python virtual environment ────────────────────────────────────────────────
@@ -57,10 +60,9 @@ RUN pip install --no-cache-dir ofscraper==${GUI_PATCH_VERSION}
 
 # ── Copy all available GUI patches and apply the selected one ─────────────────
 WORKDIR /opt/ofscraper-gui
-COPY OF-Scraper-3.12.9/patch_ofscraper_3.12.9_gui.py ./
-COPY OF-Scraper-3.14.3/patch_ofscraper_3.14.3_gui.py ./
-COPY OF-Scraper-3.14.5/patch_ofscraper_3.14.5_gui.py ./
-COPY OF-Scraper-3.14.7/patch_ofscraper_3.14.7_gui.py ./
+# The patches live at the repo root; only 3.14.7 also has a copy in its
+# OF-Scraper-X.X.X folder.
+COPY patch_ofscraper_*_gui.py ./
 
 RUN python patch_ofscraper_${GUI_PATCH_VERSION}_gui.py -y --skip-pyqt6 \
     && python -c "from ofscraper.gui.patch_version import PATCH_ID; print(f'Applied GUI patch: {PATCH_ID}')"

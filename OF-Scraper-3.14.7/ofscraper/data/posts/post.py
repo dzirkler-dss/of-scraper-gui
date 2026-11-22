@@ -40,6 +40,7 @@ from ofscraper.db.operations_.media import (
     get_unlocked_media_ids,
     batch_set_media_downloaded,
 )
+from ofscraper.filters.models.other import is_excluded_username
 from ofscraper.db.operations_.profile import (
     check_profile_table_exists,
     get_profile_info,
@@ -294,6 +295,11 @@ async def process_profile(username) -> list:
         user_profile = profile.scrape_profile(username)
         if not user_profile:
             return [], profile.API
+        # a 404 returns only this placeholder: the account is gone, so there's
+        # no avatar or header to download
+        if user_profile.get("username") == of_env.getattr("DELETED_MODEL_PLACEHOLDER"):
+            log.info(f"Skipping profile for {username}: the account no longer exists")
+            return [], profile.API
 
         # standardized_dicts now contains the correctly nested 'media' keys,
         standardized_dicts, info = profile.parse_profile(user_profile)
@@ -311,6 +317,27 @@ async def process_profile(username) -> list:
         log.traceback_(E)
         log.traceback_(traceback.format_exc())
         return [], profile.API
+
+
+async def resolve_paid_username(model_id):
+    """
+    Username for a creator in the paid-content list, including deleted accounts:
+    their recorded name if we know them, else DELETED_MODEL_PLACEHOLDER_<id>.
+    """
+    placeholder = of_env.getattr("DELETED_MODEL_PLACEHOLDER")
+    username = profile.scrape_profile(model_id).get("username")
+    # Check if the scraped username is the placeholder
+    if username == placeholder:
+        # Now, check if this model is already known to us
+        if await check_profile_table_exists(model_id=model_id, username=username):
+            # Case 1: Known deleted model. Get its unique name from our records.
+            username = (
+                await get_profile_info(model_id=model_id, username=username)
+                or f"{placeholder}_{model_id}"
+            )
+        else:
+            username = f"{placeholder}_{model_id}"
+    return username
 
 
 @free.space_checker
@@ -331,21 +358,12 @@ async def process_all_paid():
                 completed=count,
                 visible=True,
             )
-            placeholder = of_env.getattr("DELETED_MODEL_PLACEHOLDER")
-            username = profile.scrape_profile(model_id).get("username")
-            # Check if the scraped username is the placeholder
-            if username == placeholder:
-                # Now, check if this model is already known to us
-                if await check_profile_table_exists(
-                    model_id=model_id, username=username
-                ):
-                    # Case 1: Known deleted model. Get its unique name from our records.
-                    username = (
-                        await get_profile_info(model_id=model_id, username=username)
-                        or f"{placeholder}_{model_id}"
-                    )
-                else:
-                    username = f"{placeholder}_{model_id}"
+            username = await resolve_paid_username(model_id)
+            if is_excluded_username(username):
+                log.warning(
+                    f"Skipping {username}_{model_id}: excluded by --excluded-username"
+                )
+                continue
             progress_updater.activity.update_overall(
                 total=None,
                 description=all_paid_str.format(username=username),
@@ -398,7 +416,9 @@ async def process_all_paid():
 @free.space_checker
 async def process_labels(model_id, username, c):
     try:
-        labelled_posts_ = await labels_api.get_labels(model_id, c=c)
+        labelled_posts_ = await labels_api.get_labels(
+            model_id, c=c, username=username
+        )
 
         labelled_posts_labels = list(
             map(lambda x: labels.Label(x, model_id, username), labelled_posts_)
@@ -436,6 +456,8 @@ async def process_labels(model_id, username, c):
             labels_api.API,
         )
     except Exception as E:
+        # label rows weren't saved, so no label may be marked finished
+        labels_api.discard_finished_labels(model_id)
         log.traceback_(E)
         log.traceback_(traceback.format_exc())
 
@@ -451,10 +473,16 @@ async def process_areas(ele, model_id, username, c=None):
             username=username,
             downloaded=False,
         )
+        # label and media rows are saved: finished label scans can be trusted
+        labels_api.commit_finished_labels(model_id)
         return postcollection
     except Exception as E:
         log.traceback_(E)
         log.traceback_(traceback.format_exc())
+    finally:
+        # anything not committed above (an error, or a cancelled pass) is
+        # dropped, so a later pass in the same process can't trust it
+        labels_api.discard_finished_labels(model_id)
 
 
 def process_single_task(func):

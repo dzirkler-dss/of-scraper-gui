@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ofscraper.gui.signals import app_signals
-from ofscraper.gui.utils.ui_scale import apply_font
+from ofscraper.gui.utils.ui_scale import apply_font, style_page_title
 from ofscraper.gui.styles import c
 from ofscraper.gui.widgets.styled_button import StyledButton
 import ofscraper.utils.paths.common as common_paths
@@ -65,6 +65,31 @@ _AUDIO_EXT_CHOICES = ("mp3", "m4a", "wav", "aac", "flac")
 def _sanitize_ext_text(val: str, default: str) -> str:
     s = "".join(c for c in str(val or "").strip().lstrip(".").lower() if c.isalnum())
     return s or default
+
+
+# download_limit is stored in bytes per second (a bare number, or a size such
+# as "500K"), but the page shows it in KB/s. 1 KB = 1000 bytes, as in
+# --download-limit 500K.
+_KB = 1000
+# the page's spin box range; Qt can't hold much more than 2.1e9 anyway
+_DOWNLOAD_LIMIT_MAX_KB = 999999
+
+
+def _download_limit_to_kb(stored) -> int:
+    try:
+        from humanfriendly import parse_size
+
+        limit = parse_size(str(stored).strip()) if stored not in (None, "") else 0
+    except Exception:
+        return 0
+    if limit <= 0:
+        return 0
+    # Never round a set limit down to 0, which would mean "unlimited"
+    return min(_DOWNLOAD_LIMIT_MAX_KB, max(1, round(limit / _KB)))
+
+
+def _download_limit_from_kb(kb: int) -> int:
+    return int(kb) * _KB
 
 
 def _display_fs_path(value: str) -> str:
@@ -127,8 +152,7 @@ class ConfigPage(QWidget):
 
         # Header
         header = QLabel("Configuration")
-        apply_font(header, "Segoe UI", 22, QFont.Weight.Bold)
-        header.setProperty("heading", True)
+        style_page_title(header)
         layout.addWidget(header)
 
         subtitle = QLabel("Edit application settings. Changes are saved to config.json.")
@@ -567,7 +591,7 @@ class ConfigPage(QWidget):
                                "Used in File Format {text} and when naming .txt files from captions.\n"
                                "Keep under ~250 when naming text files from post text so\n"
                                "name + \".txt\" stays within the 255-character/byte OS limit.\n"
-                               "0 = do not include post text in media filenames.")
+                               "0 = no limit (keep the whole post text).")
         self._add_line(form, "space_replacer", "Space Replacer", " ",
                        tooltip="Character(s) to replace spaces in filenames.\nLeave empty to keep spaces as-is.")
         self._add_line(form, "date", "Date Format", "YYYY-MM-DD",
@@ -783,8 +807,9 @@ class ConfigPage(QWidget):
         scroll, form = self._create_scrollable_form()
         self._add_spin(form, "download_sems", "Download Semaphores", 1, 15, 6,
                        tooltip="Number of concurrent downloads per thread (1-15).\nHigher = more parallel downloads but may hit rate limits.")
-        self._add_spin(form, "download_limit", "Download Speed Limit (KB/s)", 0, 999999, 0,
-                       "0 = unlimited")
+        self._add_spin(form, "download_limit", "Download Speed Limit (KB/s)", 0, _DOWNLOAD_LIMIT_MAX_KB, 0,
+                       "0 = unlimited. 1 KB = 1000 bytes, as in --download-limit 500K.\n"
+                       "One limit shared by all downloads, not set per thread.")
         return scroll
 
     def _create_content_tab(self):
@@ -863,7 +888,9 @@ class ConfigPage(QWidget):
             form,
             "dynamic-mode-default",
             "Dynamic Mode",
-            ["datawhores", "digitalcriminals", "xagler", "rafa", "generic", "manual"],
+            # digitalcriminals is listed and saved as "digital", the name a
+            # new config.json holds; its other names select it on load
+            ["datawhores", "digital", "xagler", "rafa", "generic", "manual"],
             tooltip=(
                 "Controls where OF request-signing rules are fetched from.\n"
                 "If scraping breaks due to auth/signature issues, try switching this.\n\n"
@@ -913,12 +940,13 @@ class ConfigPage(QWidget):
             form,
             "cache-mode",
             "Cache Mode",
-            ["sqlite", "json", "disabled"],
+            ["sqlite", "json", "disabled", "api_disabled"],
             tooltip=(
                 "Storage backend for OF-Scraper's local cache.\n"
                 "- sqlite: faster + more robust for larger caches\n"
                 "- json: simpler, sometimes slower\n"
-                "- disabled: attempt to disable caching (may reduce performance)\n\n"
+                "- disabled: turn the cache off, like --no-cache (may reduce performance)\n"
+                "- api_disabled: turn off only the API response cache, like --no-api-cache\n\n"
                 "Tip: For a one-off rescrape, use the GUI 'ignore cache' options."
             ),
         )
@@ -1174,6 +1202,8 @@ class ConfigPage(QWidget):
                         widget.setPlainText(json.dumps(val, indent=2) if val else "")
                     else:
                         widget.setPlainText(str(val).strip() if val else "")
+                elif isinstance(widget, QSpinBox) and key == "download_limit":
+                    widget.setValue(_download_limit_to_kb(val))
                 elif isinstance(widget, QSpinBox):
                     try:
                         widget.setValue(int(val) if val else 0)
@@ -1192,6 +1222,11 @@ class ConfigPage(QWidget):
                     else:
                         widget.setChecked(bool(val))
                 elif isinstance(widget, QComboBox):
+                    if key == "dynamic-mode-default":
+                        # "dc", "digitalcriminals" etc. are listed as "digital"
+                        from ofscraper.utils.const import dynamic_menu_name
+
+                        val = dynamic_menu_name(val) if val else val
                     idx = widget.findText(str(val))
                     if idx >= 0:
                         widget.setCurrentIndex(idx)
@@ -1456,10 +1491,18 @@ class ConfigPage(QWidget):
                     pass
 
             # Performance
-            for k in ["download_sems", "download_limit"]:
-                w = self._widgets.get(k)
-                if w:
-                    set_nested(config, "performance_options", k, w.value())
+            w = self._widgets.get("download_sems")
+            if w:
+                set_nested(config, "performance_options", "download_sems", w.value())
+            w = self._widgets.get("download_limit")
+            if w:
+                # shown in KB/s, stored in bytes per second
+                set_nested(
+                    config,
+                    "performance_options",
+                    "download_limit",
+                    _download_limit_from_kb(w.value()),
+                )
 
             # Content
             w = self._widgets.get("block_ads")

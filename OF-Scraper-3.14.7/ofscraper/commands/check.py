@@ -1,6 +1,8 @@
 import asyncio
+import ofscraper.utils.system.system as system
 import inspect
 import logging
+import pathlib
 import re
 import threading
 import time
@@ -38,6 +40,7 @@ from ofscraper.commands.utils.strings import check_str
 from ofscraper.db.operations import make_changes_to_content_tables
 from ofscraper.db.operations_.media import (
     batch_mediainsert,
+    get_downloaded_media_paths,
     get_media_post_ids_downloaded,
 )
 from ofscraper.utils.checkers import check_auth
@@ -57,6 +60,9 @@ ROWS = {}
 MEDIA_KEY = ["id", "postid", "username"]
 check_user_dict = defaultdict(dict)
 _msg_check_filter = "paid_only"  # "paid_only" | "free_only" | "all"
+# GUI "Compare with files on disk": a downloaded item whose file is gone shows
+# as not downloaded
+_disk_check = False
 
 
 def process_download_queue():
@@ -608,7 +614,7 @@ async def message_check_retriver(forced=False):
                     paid = oldpaid
                 else:
                     log.info(f"[{user_name}] Fetching fresh data for {paid_.API}")
-                    paid = await paid_.get_paid_posts(model_id, user_name, c=c)
+                    paid = await paid_.get_paid_posts(user_name, model_id, c=c)
                     set_check(paid, model_id, paid_.API)
 
                 paid_posts_array = list(
@@ -650,7 +656,7 @@ async def purchase_check_retriver(forced=False):
     async with manager.Manager.session.aget_ofsession(
         sem_count=of_env.getattr("API_REQ_CHECK_MAX"),
     ) as c:
-        for name in settings.get_settings().check_usernames:
+        for name in check_usernames():
             user_name = profile.scrape_profile(name)["username"]
             model_id = name if name.isnumeric() else profile.get_id(user_name)
             user_dict[model_id] = user_dict.get(model_id, [])
@@ -674,7 +680,7 @@ async def purchase_check_retriver(forced=False):
                 ]
             else:
                 log.info(f"[{user_name}] Fetching fresh data for {paid_.API}")
-                paid = await paid_.get_paid_posts(model_id, user_name, c=c)
+                paid = await paid_.get_paid_posts(user_name, model_id, c=c)
                 set_check(paid, model_id, paid_.API)
             posts_array = list(map(lambda x: posts_.Post(x, model_id, user_name), paid))
             yield user_name, model_id, posts_array
@@ -707,7 +713,7 @@ async def stories_check_retriver(forced=False):
     async with manager.Manager.session.aget_ofsession(
         sem_count=of_env.getattr("API_REQ_CHECK_MAX"),
     ) as c:
-        for user_name in settings.get_settings().check_usernames:
+        for user_name in check_usernames():
             user_name = profile.scrape_profile(user_name)["username"]
             model_id = profile.get_id(user_name)
             user_dict[model_id] = user_dict.get(model_id, [])
@@ -724,6 +730,14 @@ async def stories_check_retriver(forced=False):
                 map(lambda x: posts_.Post(x, model_id, user_name, "stories"), stories)
             )
             yield user_name, model_id, stories + highlights_
+
+
+def check_usernames():
+    # usernames from -u and from the files given with -f
+    current = settings.get_settings()
+    return list(current.check_usernames or []) + list(
+        getattr(current, "file_usernames", None) or []
+    )
 
 
 def url_helper():
@@ -768,7 +782,7 @@ async def get_paid_ids(model_id, user_name):
         async with manager.Manager.session.aget_ofsession(
             sem_count=of_env.getattr("API_REQ_CHECK_MAX")
         ) as c:
-            paid = await paid_.get_paid_posts(model_id, user_name, c=c)
+            paid = await paid_.get_paid_posts(user_name, model_id, c=c)
             set_check(paid, model_id, paid_.API)
 
     media = await process_post_media(user_name, model_id, paid)
@@ -786,7 +800,7 @@ def start_table(ROWS_):
     # GUI mode must not launch the Textual TUI — gui_checker emits data_replace instead.
     if getattr(settings.get_args(), "gui", False):
         return
-    loop = asyncio.new_event_loop()
+    loop = system.new_event_loop()
     asyncio.set_event_loop(loop)
     ROWS = ROWS_
     app.app(table_data=ROWS)
@@ -807,7 +821,9 @@ def texthelper(text):
 
 
 def unlocked_helper(ele):
-    return ele.canview
+    # canview can be None when OnlyFans sends canView: null; the table
+    # shows that as locked, like the cart cell does
+    return bool(ele.canview)
 
 
 def download_type_helper(ele):
@@ -833,6 +849,16 @@ async def row_gather(username, model_id):
     downloaded = set(
         get_media_post_ids_downloaded(model_id=model_id, username=username)
     )
+    if _disk_check:
+        missing = missing_downloaded_files(
+            get_downloaded_media_paths(model_id=model_id, username=username)
+        )
+        if missing:
+            log.info(
+                f"[{username}] {len(missing)} downloaded item(s) not found on disk; "
+                "shown as not downloaded"
+            )
+        downloaded -= missing
 
     m_id = str(model_id)
     collection = check_user_dict[m_id].get("collection")
@@ -906,6 +932,35 @@ async def row_gather(username, model_id):
     ROWS.extend(out)
 
 
+def missing_downloaded_files(paths: dict) -> set:
+    """Keys of downloaded media whose recorded file isn't on disk. A row with
+    no recorded file name can't be checked and is left as downloaded."""
+    missing = set()
+    for key, (directory, filename) in paths.items():
+        if not filename:
+            continue
+        path = pathlib.Path(filename)
+        if not path.is_absolute():
+            path = pathlib.Path(directory or "", filename)
+        if not path.is_file():
+            missing.add(key)
+    return missing
+
+
+def msg_row_is_paid(row) -> bool:
+    """A paid/PPV message or purchase, or a locked one."""
+    return str(row.get("price", "Free")) != "Free" or not row.get("unlocked", True)
+
+
+def filter_message_rows(rows, msg_filter):
+    """Apply the GUI's Check messages filter: paid_only, free_only or all."""
+    if msg_filter == "paid_only":
+        return [r for r in rows if msg_row_is_paid(r)]
+    if msg_filter == "free_only":
+        return [r for r in rows if not msg_row_is_paid(r)]
+    return list(rows)
+
+
 def _normalize_rows_for_gui(rows):
     """Normalize check.py ROWS list for the GUI data table.
 
@@ -923,7 +978,7 @@ def _normalize_rows_for_gui(rows):
     return result
 
 
-def gui_checker(check_mode, msg_filter="paid_only"):
+def gui_checker(check_mode, msg_filter="paid_only", disk_check=False):
     """GUI-compatible entry point for check modes.
 
     Runs the appropriate data-fetch runner, then emits the collected rows via
@@ -939,8 +994,9 @@ def gui_checker(check_mode, msg_filter="paid_only"):
             "free_only": free messages only, hides paid/PPV content
             "all": all messages, no filtering
     """
-    global _msg_check_filter
+    global _msg_check_filter, _disk_check
     _msg_check_filter = msg_filter
+    _disk_check = bool(disk_check)
     from ofscraper.gui.signals import app_signals
     import ofscraper.classes.table.app as _tui_app
 
@@ -998,7 +1054,14 @@ def gui_checker(check_mode, msg_filter="paid_only"):
         app_signals.scraping_finished.emit()
         return
 
-    gui_rows = _normalize_rows_for_gui(ROWS)
+    rows = ROWS or []
+    if check_mode == "msg_check":
+        before = len(rows)
+        rows = filter_message_rows(rows, _msg_check_filter)
+        log.info(f"gui_checker: message filter {_msg_check_filter}: {len(rows)} of {before} rows")
+        # renumber so the table's Number column has no gaps
+        rows = [dict(r, index=i + 1, number=i + 1) for i, r in enumerate(rows)]
+    gui_rows = _normalize_rows_for_gui(rows)
     log.info(f"gui_checker: emitting {len(gui_rows)} rows via data_replace")
     try:
         app_signals.data_replace.emit(gui_rows)

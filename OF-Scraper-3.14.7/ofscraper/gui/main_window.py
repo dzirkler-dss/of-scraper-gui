@@ -515,7 +515,7 @@ class MainWindow(QMainWindow):
         ]
         _logo_html = (
             f"<pre style='color:#89b4fa; font-family:Consolas,monospace; "
-            f"font-size:{_LOGO_PT}pt; margin:0; line-height:1;'>"
+            f"font-size:{_LOGO_PT}pt; font-weight:bold; margin:0; line-height:1;'>"
             + "\n".join(_html.escape(l) for l in _logo_lines)
             + "</pre>"
         )
@@ -652,6 +652,54 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready")
+        # The scrape table has its own status strip with the same messages.
+        self.stack.currentChanged.connect(lambda _i: self._sync_status_bar())
+        self.scraper_stack.currentChanged.connect(lambda _i: self._sync_status_bar())
+        self._sync_status_bar()
+
+    def _note_page_for_crash_log(self):
+        """Keep page=… in crash breadcrumbs current (sidebar and Scraper steps)."""
+        try:
+            from ofscraper.gui.utils.crash_diagnostics import set_last_page
+
+            current = self.stack.currentWidget()
+            page = next((k for k, w in self._pages.items() if w is current), "?")
+            if page == "scraper":
+                step = self.scraper_stack.currentWidget()
+                page = f"scraper/{type(step).__name__}" if step is not None else page
+            set_last_page(page)
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        # spontaneous: from the window system (✕, Alt+F4, the OS); otherwise
+        # close() was called in code — record where from.
+        try:
+            from ofscraper.gui.utils.crash_diagnostics import gui_action
+
+            detail = f"spontaneous={event.spontaneous()}"
+            if not event.spontaneous():
+                import traceback
+
+                detail += " from " + " <- ".join(
+                    f"{f.name}:{f.lineno}" for f in reversed(traceback.extract_stack()[-8:-1])
+                )
+            gui_action("main_window_close", detail)
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    def _sync_status_bar(self):
+        """Hide the window status bar while the scrape table (own strip) shows."""
+        self._note_page_for_crash_log()
+        try:
+            on_table = (
+                self.stack.currentWidget() is self._pages.get("scraper")
+                and self.scraper_stack.currentWidget() is self.table_page
+            )
+            self.status_bar.setVisible(not on_table)
+        except Exception:
+            pass
 
     def _toggle_theme(self):
         """Switch between dark and light themes, then offer to save as default.
@@ -820,11 +868,15 @@ class MainWindow(QMainWindow):
                     log_dir.mkdir(parents=True, exist_ok=True)
                     log_path = log_dir / f"ofscraper_gui_verbose_{profile}_{timestamp}.log"
 
-                    fmt = r" %(asctime)s:[%(module)s.%(funcName)s:%(lineno)d]  %(message)s"
+                    # "\[" as in utils/logs/other.py: LogFileFormatter removes
+                    # Rich markup, and an unescaped "[" would drop the location
+                    fmt = r" %(asctime)s:\[%(module)s.%(funcName)s:%(lineno)d]  %(message)s"
                     stream = open(log_path, "a", encoding="utf-8")
                     fh = _logging.StreamHandler(stream)
                     fh.setLevel(_logging.DEBUG)
-                    fh.setFormatter(_logging.Formatter(fmt, "%Y-%m-%d %H:%M:%S"))
+                    # same formatter as the normal log file: masks the
+                    # session cookie and other secrets, strips Rich markup
+                    fh.setFormatter(_log_class.LogFileFormatter(fmt, "%Y-%m-%d %H:%M:%S"))
                     setattr(fh, _GUI_VERBOSE_TAG, True)
                     fh._gui_verbose_stream = stream
                     logger.addHandler(fh)
@@ -908,7 +960,7 @@ class MainWindow(QMainWindow):
         # stretch/squash monospace art (and QLabel may not shrink after grow).
         _logo_html = (
             f"<pre style='color:{logo_color}; font-family:Consolas,monospace; "
-            f"font-size:{_LOGO_PT}pt; margin:0; line-height:1;'>"
+            f"font-size:{_LOGO_PT}pt; font-weight:bold; margin:0; line-height:1;'>"
             + "\n".join(_html.escape(l) for l in _logo_lines)
             + "</pre>"
         )
@@ -1268,6 +1320,11 @@ class MainWindow(QMainWindow):
         """Move from action page to area/filter configuration page, or URL input page."""
         if actions == {"manual_url"}:
             self.scraper_stack.setCurrentWidget(self.url_input_page)
+        elif actions == {"paid_all"}:
+            # All purchased content: no areas or models to pick — start now.
+            self.scraper_stack.setCurrentWidget(self.table_page)
+            self.table_page.sidebar.setVisible(False)
+            self.table_page.start_paid_all_run()
         else:
             self.scraper_stack.setCurrentWidget(self.area_page)
 
@@ -1462,7 +1519,9 @@ class MainWindow(QMainWindow):
             else None
         )
 
-        ffmpeg_raw = (str(ffmpeg_path).strip() if ffmpeg_path is not None else "")
+        from ofscraper.utils.config.path_norm import strip_path_quotes
+
+        ffmpeg_raw = strip_path_quotes(str(ffmpeg_path)) if ffmpeg_path is not None else ""
         missing_ffmpeg = True
         if ffmpeg_raw:
             try:
@@ -1472,8 +1531,8 @@ class MainWindow(QMainWindow):
 
         cdm_opts = cfg.get("cdm_options") if isinstance(cfg.get("cdm_options"), dict) else {}
         key_mode = str(cdm_opts.get("key-mode-default") or "manual").lower().strip() or "manual"
-        client_raw = str(cdm_client).strip() if cdm_client is not None else ""
-        priv_raw = str(cdm_private).strip() if cdm_private is not None else ""
+        client_raw = strip_path_quotes(str(cdm_client)) if cdm_client is not None else ""
+        priv_raw = strip_path_quotes(str(cdm_private)) if cdm_private is not None else ""
         missing_manual_cdm = True
         if client_raw and priv_raw:
             try:

@@ -2,7 +2,8 @@
 
 Hard Qt/native crashes often leave no Python traceback. This module:
 
-1. Enables ``faulthandler`` dumping to a dedicated file
+1. Enables ``faulthandler`` dumping to a dedicated file (on a crash; periodic
+   hang dumps only with OFSCRAPER_GUI_HANG_DUMP_SECONDS set)
 2. Installs ``sys.excepthook`` / ``threading.excepthook`` and a Qt message handler
 3. ``breadcrumb()`` / ``gui_action()`` — always-on flushed markers (independent of
    Verbose Log) so the last UI action + whether a model-fetch/scrape was in flight
@@ -12,6 +13,8 @@ from __future__ import annotations
 
 import faulthandler
 import logging
+import os
+import shutil
 import sys
 import threading
 import traceback
@@ -26,6 +29,14 @@ _fault_path: Optional[Path] = None
 _fault_fp = None
 _installed = False
 _lock = threading.Lock()
+
+# Periodic "hang" dumps (faulthandler.dump_traceback_later) are off unless this
+# env var gives an interval in seconds. They read every thread's stack from a
+# watchdog thread while the others keep running, and on Windows that crashed the
+# GUI with an access violation whenever a thread was busy at dump time.
+HANG_DUMP_ENV = "OFSCRAPER_GUI_HANG_DUMP_SECONDS"
+# Past this size, faulthandler.log is moved to faulthandler.log.1 at startup.
+FAULT_LOG_MAX_BYTES = 5 * 1024 * 1024
 
 # Concurrent activity flags — included on every gui_action / breadcrumb line.
 _activity_lock = threading.Lock()
@@ -62,6 +73,44 @@ def fault_log_path() -> Path:
     if _fault_path is None:
         _fault_path = diagnostics_dir() / "faulthandler.log"
     return _fault_path
+
+
+def _fault_log_header(text: str) -> str:
+    return f"\n===== {text} {datetime.now(timezone.utc).isoformat()} =====\n"
+
+
+def trim_fault_log() -> bool:
+    """Move a too-big faulthandler.log to faulthandler.log.1 and start it fresh.
+
+    faulthandler keeps writing to the same open file, which is in append mode,
+    so the file is copied and then truncated in place. Returns True if trimmed.
+    """
+    path = fault_log_path()
+    try:
+        if path.stat().st_size <= FAULT_LOG_MAX_BYTES:
+            return False
+        shutil.copyfile(path, path.with_name(path.name + ".1"))
+        if _fault_fp is not None:
+            _fault_fp.flush()
+            os.ftruncate(_fault_fp.fileno(), 0)
+            _fault_fp.write(
+                _fault_log_header(f"trimmed (older part in {path.name}.1)")
+            )
+            _fault_fp.flush()
+        else:
+            path.unlink()
+        return True
+    except Exception:
+        return False
+
+
+def hang_dump_seconds() -> Optional[float]:
+    """Interval for periodic hang dumps, or None (the default: off)."""
+    try:
+        seconds = float(os.environ.get(HANG_DUMP_ENV, "") or 0)
+    except ValueError:
+        return None
+    return seconds if seconds > 0 else None
 
 
 def set_model_fetch_active(active: bool) -> None:
@@ -160,6 +209,60 @@ def gui_action(kind: str, detail: str = "") -> None:
     _write_line(f"ui_{kind}", detail)
 
 
+def _short_stack(skip: int = 1, depth: int = 8) -> str:
+    frames = traceback.extract_stack()[: -(skip + 1)][-depth:]
+    return " <- ".join(f"{Path(f.filename).name}:{f.name}:{f.lineno}" for f in reversed(frames))
+
+
+def install_exit_tracing(app) -> None:
+    """Breadcrumbs for every way the GUI can end, so the next crash log says which.
+
+    Records: the Qt event loop quitting (aboutToQuit), the last window closing,
+    Python exiting (atexit, with the threads still running) and any
+    sys.exit()/exit()/quit() call with where it came from.
+    """
+    import atexit
+    import builtins
+    import threading
+
+    try:
+        app.aboutToQuit.connect(lambda: _write_line("ui_app_about_to_quit"))
+        app.lastWindowClosed.connect(lambda: _write_line("ui_last_window_closed"))
+    except Exception:
+        pass
+
+    def _traced(name, original):
+        def _exit(*args):
+            try:
+                _write_line(
+                    "exit_call",
+                    f"{name}({', '.join(repr(a) for a in args)}) "
+                    f"thread={threading.current_thread().name} from {_short_stack()}",
+                )
+            except Exception:
+                pass
+            return original(*args)
+
+        _exit.__wrapped__ = original
+        return _exit
+
+    if not hasattr(sys.exit, "__wrapped__"):
+        sys.exit = _traced("sys.exit", sys.exit)
+        for name in ("exit", "quit"):
+            original = getattr(builtins, name, None)
+            if original is not None:
+                setattr(builtins, name, _traced(name, original))
+
+    def _at_python_exit():
+        try:
+            names = sorted(t.name for t in threading.enumerate())
+            _write_line("python_exit", f"threads={names}")
+        except Exception:
+            pass
+
+    atexit.register(_at_python_exit)
+
+
 def install_crash_diagnostics() -> None:
     """Install once at GUI startup. Safe to call repeatedly."""
     global _installed, _fault_fp
@@ -169,16 +272,18 @@ def install_crash_diagnostics() -> None:
 
     try:
         fault_path = fault_log_path()
+        trim_fault_log()
         _fault_fp = open(fault_path, "a", encoding="utf-8", buffering=1)
-        _fault_fp.write(
-            f"\n===== faulthandler enabled {datetime.now(timezone.utc).isoformat()} =====\n"
-        )
+        _fault_fp.write(_fault_log_header("faulthandler enabled"))
         _fault_fp.flush()
         faulthandler.enable(file=_fault_fp, all_threads=True)
-        try:
-            faulthandler.dump_traceback_later(300, repeat=True, file=_fault_fp)
-        except Exception:
-            pass
+        seconds = hang_dump_seconds()
+        if seconds:
+            try:
+                faulthandler.dump_traceback_later(seconds, repeat=True, file=_fault_fp)
+                log.info(f"[GUI crash diag] hang dumps every {seconds:g}s ({HANG_DUMP_ENV})")
+            except Exception:
+                pass
         log.info(f"[GUI crash diag] faulthandler → {fault_path}")
     except Exception as e:
         log.warning(f"[GUI crash diag] Could not enable faulthandler: {e}")

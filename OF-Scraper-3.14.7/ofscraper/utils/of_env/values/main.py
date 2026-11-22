@@ -115,6 +115,16 @@ def load_main_config():
         "OFSC_TRUNCATION_DEFAULT", "True"
     ).lower() in ("true", "1")
 
+    # FILENAME_COLLISION_DEFAULT: What to do when a download's path is already
+    # taken by a different file. "overwrite" keeps the old behaviour (the larger
+    # file replaces the other); "media_id" keeps both, saving the new one as
+    # name_<media_id>. Note: with "media_id", re-downloading the same media
+    # with different bytes (e.g. --force-all) also gets a _<media_id> copy.
+    # Default: overwrite
+    config["FILENAME_COLLISION_DEFAULT"] = os.getenv(
+        "OFSC_FILENAME_COLLISION_DEFAULT", "overwrite"
+    )
+
     # MAX_COUNT_DEFAULT: Default maximum count for certain operations.
     # Default: 0 (no limit)
     config["MAX_COUNT_DEFAULT"] = int(os.getenv("OFSC_MAX_COUNT_DEFAULT", "0"))
@@ -191,6 +201,10 @@ def load_main_config():
     config["INCLUDE_LABELS_ALL"] = os.getenv(
         "OFSC_INCLUDE_LABELS_ALL", "False"
     ).lower() in ("true", "1")
+
+    # LABELS_CONCURRENCY: How many labels are paged at the same time.
+    # Default: 5 (this GUI's earlier fixed limit)
+    config["LABELS_CONCURRENCY"] = int(os.getenv("OFSC_LABELS_CONCURRENCY", "5"))
 
     # DISCORD_THREAD_OVERRIDE: Whether to override Discord threading.
     # Default: False
