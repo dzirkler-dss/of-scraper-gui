@@ -2,7 +2,7 @@ name: Build OF-Scraper GUI image
 
 on:
   push:
-    branches: [main, fork/build-p422]
+    branches: [main]
     paths:
       - 'docker/**'
       - 'patch_ofscraper_*_gui.py'
